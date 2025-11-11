@@ -1,16 +1,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
-#include <string.h> 
-#include <errno.h>  
+#include <string.h>
+#include <errno.h>
 #include <cuda_runtime.h>
 
+#define INF 9999999
+#define N 1024        
+#define BLOCK_SIZE 16
 
-#define INF 9999999   
-#define N 1024        //ALTERE AQUI PARA OS TESTES
-#define BLOCK_SIZE 16 
-
-//Função auxiliar para checar e reportar erros de CUDA.
 static void checkCuda(cudaError_t result) {
     if (result != cudaSuccess) {
         fprintf(stderr, "CUDA Error: %s\n", cudaGetErrorString(result));
@@ -18,10 +16,7 @@ static void checkCuda(cudaError_t result) {
     }
 }
 
-/*
-Kernel CUDA para uma iteração 'k' do Floyd-Warshall.
-Lê da matriz de entrada 'd_in' e escreve o resultado em 'd_out'.
- */
+//Kernel: lê de d_in, escreve em d_out(iteracao fixa k)
 __global__ void floyd_kernel(const int* d_in, int* d_out, int k, int n) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     int i = blockIdx.y * blockDim.y + threadIdx.y;
@@ -35,25 +30,20 @@ __global__ void floyd_kernel(const int* d_in, int* d_out, int k, int n) {
         int dik = d_in[ik_idx];
         int dkj = d_in[kj_idx];
 
-        //Checa por INF antes de somar para evitar overflow
         if (dik == INF || dkj == INF) {
-            d_out[ij_idx] = dij; 
+            d_out[ij_idx] = dij;
         } else {
-            //Calcula o novo caminho passando por 'k'
             int new_dist = dik + dkj;
-            
-            //Escreve o mínimo 
             d_out[ij_idx] = (dij > new_dist) ? new_dist : dij;
         }
     }
 }
 
-//Versão sequencial (CPU) do Floyd-Warshall.
+//Versão sequencial do Floyd-Warshall.
 void floyd_cpu(int* dist, int n) {
     for (int k = 0; k < n; k++) {
         for (int i = 0; i < n; i++) {
             for (int j = 0; j < n; j++) {
-                
                 int ij_idx = i * n + j;
                 int ik_idx = i * n + k;
                 int kj_idx = k * n + j;
@@ -64,23 +54,49 @@ void floyd_cpu(int* dist, int n) {
                 if (dik == INF || dkj == INF) continue;
 
                 int new_dist = dik + dkj;
-            
-                //Atualiza a distância se o novo caminho for menor
-                if (dist[ij_idx] > new_dist) {
-                    dist[ij_idx] = new_dist;
-                }
+                if (dist[ij_idx] > new_dist) dist[ij_idx] = new_dist;
             }
         }
     }
 }
 
-//Verifica se os resultados da CPU e GPU são idênticos.
+
+void load_graph_from_file(const char* filename, int* dist, int n) {
+    FILE* f = fopen(filename, "r");
+    if (!f) {
+        fprintf(stderr, "Erro ao abrir %s: %s\n", filename, strerror(errno));
+        exit(1);
+    }
+    for (int i = 0; i < n * n; i++) {
+        if (fscanf(f, "%d", &dist[i]) != 1) {
+            fprintf(stderr, "Erro ao ler grafo na posicao %d.\n", i);
+            fclose(f);
+            exit(1);
+        }
+    }
+    fclose(f);
+}
+
+void save_result_to_file(const char* filename, int* dist, int n) {
+    FILE* f = fopen(filename, "w");
+    if (!f) {
+        fprintf(stderr, "Erro ao criar %s\n", filename);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            if (dist[i * n + j] == INF) fprintf(f, "INF ");
+            else fprintf(f, "%d ", dist[i * n + j]);
+        }
+        fprintf(f, "\n");
+    }
+    fclose(f);
+}
 
 bool verify_results(int* cpu_res, int* gpu_res, int n) {
     for (int i = 0; i < n * n; i++) {
         if (cpu_res[i] != gpu_res[i]) {
-            //Reporta o primeiro erro encontrado
-            printf("Erro na verificação! Posição %d: CPU=%d, GPU=%d\n",
+            printf("Erro na verificacao! Posicao %d: CPU=%d, GPU=%d\n",
                    i, cpu_res[i], gpu_res[i]);
             return false;
         }
@@ -88,119 +104,88 @@ bool verify_results(int* cpu_res, int* gpu_res, int n) {
     return true;
 }
 
-
-int main(int argc, char* argv[]) {
-    
-    //Validação dos argumentos de linha de comando
-    if (argc != 2) {
-        fprintf(stderr, "Uso: ./apsp_exec <arquivo_do_grafo>\n");
-        return -1;
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        printf("Uso: %s grafo.txt\n", argv[0]);
+        return 1;
     }
-    char* graph_filename = argv[1];
 
-    printf("Iniciando APSP com N = %d\n", N);
-    srand((unsigned)time(NULL));
+    const char* graph_filename = argv[1];
 
-    //Alocação de Memória (CPU) 
     size_t matrix_size = (size_t)N * N * sizeof(int);
-
-    int* h_dist_cpu = (int*)malloc(matrix_size);  
-    int* h_dist_in  = (int*)malloc(matrix_size);  
-    int* h_dist_out = (int*)malloc(matrix_size); 
+    int* h_dist_cpu = (int*)malloc(matrix_size);
+    int* h_dist_in  = (int*)malloc(matrix_size);
+    int* h_dist_out = (int*)malloc(matrix_size);
 
     if (!h_dist_cpu || !h_dist_in || !h_dist_out) {
-        fprintf(stderr, "Falha ao alocar memória no host\n");
+        fprintf(stderr, "Falha ao alocar memoria no host\n");
         return -1;
     }
 
-    //Leitura do Grafo
-    printf("Lendo grafo do arquivo: %s\n", graph_filename);
-    FILE* fp = fopen(graph_filename, "r");
-    if (fp == NULL) {
-        fprintf(stderr, "Erro ao abrir o arquivo %s: %s\n", graph_filename, strerror(errno));
-        return -1;
-    }
-
-    //Lê os dados do arquivo para a matriz de entrada
-    for (int i = 0; i < N * N; i++) {
-        if (fscanf(fp, "%d", &h_dist_in[i]) != 1) {
-            fprintf(stderr, "Erro ao ler dados do arquivo (posição %d).\n", i);
-            fclose(fp);
-            return -1;
-        }
-    }
-    fclose(fp);
-
-    //Copia os dados lidos para a matriz de teste da CPU
+    //Carrega grafo e copia para CPU
+    load_graph_from_file(graph_filename, h_dist_in, N);
     memcpy(h_dist_cpu, h_dist_in, matrix_size);
 
-    //3. Execução CPU
-    printf("Executando Floyd-Warshall na CPU...\n");
+
+    // Execução na CPU
     clock_t cpu_start = clock();
     floyd_cpu(h_dist_cpu, N);
     clock_t cpu_end = clock();
-    double cpu_time_ms = ((double)(cpu_end - cpu_start) / CLOCKS_PER_SEC) * 1000.0;
-    printf("Tempo CPU: %.6f ms\n", cpu_time_ms);
+    double cpu_time_s = ((double)(cpu_end - cpu_start) / CLOCKS_PER_SEC);
 
-    //Execução GPU
-    printf("Executando Floyd-Warshall na GPU...\n");
-    
+
+    // Execução na GPU
     int *d_in = NULL, *d_out = NULL;
+
+    //Medição total (inclui alocação + cópia H2D + kernels + cópia D2H)
+    double gpu_total_time_s = 0.0;
+
+    //Início da medição total
+    clock_t total_start = clock();
+
     checkCuda(cudaMalloc((void**)&d_in, matrix_size));
     checkCuda(cudaMalloc((void**)&d_out, matrix_size));
+
+    //Cópia host --> device
     checkCuda(cudaMemcpy(d_in, h_dist_in, matrix_size, cudaMemcpyHostToDevice));
 
     dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
     dim3 gridSize((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-    cudaEvent_t start, stop;
-    checkCuda(cudaEventCreate(&start));
-    checkCuda(cudaEventCreate(&stop));
-    
-    //Inicia o cronômetro
-    checkCuda(cudaEventRecord(start, 0));
-
+    //Loop principal do algoritmo (GPU)
     for (int k = 0; k < N; k++) {
         floyd_kernel<<<gridSize, blockSize>>>(d_in, d_out, k, N);
-        
         checkCuda(cudaGetLastError());
-        checkCuda(cudaDeviceSynchronize()); 
-
-        int* tmp = d_in;
-        d_in = d_out;
-        d_out = tmp;
+        checkCuda(cudaDeviceSynchronize());
+        int* tmp = d_in; d_in = d_out; d_out = tmp;
     }
 
-    //Para o cronômetro
-    checkCuda(cudaEventRecord(stop, 0));
-    checkCuda(cudaEventSynchronize(stop)); 
-
-    //Calcula o tempo
-    float gpu_time_ms = 0;
-    checkCuda(cudaEventElapsedTime(&gpu_time_ms, start, stop));
-    printf("Tempo GPU: %.6f ms\n", gpu_time_ms);
-
-    //5. Verificação e Resultados 
-
+    //Cópia device --> host
     checkCuda(cudaMemcpy(h_dist_out, d_in, matrix_size, cudaMemcpyDeviceToHost));
 
-    //Verifica se CPU e GPU geraram a mesma matriz
-    bool success = verify_results(h_dist_cpu, h_dist_out, N);
-    if (success) printf("Sucesso! Os resultados da CPU e GPU são idênticos.\n");
-    else printf("Falha! Os resultados são diferentes.\n");
+    //Fim da medição total
+    clock_t total_end = clock();
+    gpu_total_time_s = ((double)(total_end - total_start) / CLOCKS_PER_SEC);
 
-    //Imprime o Speedup
-    double speedup = cpu_time_ms / (double)gpu_time_ms;
-    printf("Speedup (CPU/GPU): %.2f x\n", speedup);
-    
-    printf("\nCSV_DATA,%.6f,%.6f,%.2f\n", cpu_time_ms, (double)gpu_time_ms, speedup);
+    //Verificação de resultados
+    bool ok = verify_results(h_dist_cpu, h_dist_out, N);
+    if (!ok) {
+        fprintf(stderr, "Falha na verificacao entre CPU e GPU. Abortando.\n");
+    } else {
+        printf("Sucesso! CPU e GPU produzem o mesmo resultado.\n");
+    }
 
-    //6. Limpeza
+
+    //Cálculo e impressão do speedup
+    double speedup_total = cpu_time_s / gpu_total_time_s;
+
+    printf("Tempo CPU: %.6f s\n", cpu_time_s);
+    printf("Tempo GPU: %.6f s\n", gpu_total_time_s);
+    printf("Speedup (CPU / GPU total): %.2fx\n", speedup_total);
+
+    //Limpeza
     checkCuda(cudaFree(d_in));
     checkCuda(cudaFree(d_out));
-    checkCuda(cudaEventDestroy(start));
-    checkCuda(cudaEventDestroy(stop));
-
     free(h_dist_cpu);
     free(h_dist_in);
     free(h_dist_out);
